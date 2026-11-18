@@ -7,6 +7,9 @@ on:
 permissions:
   contents: write
 
+env:
+  LOG: ci.log
+
 jobs:
   probe:
     runs-on: xcode-27
@@ -14,18 +17,19 @@ jobs:
     steps:
       - name: Runner (medidas reais)
         run: |
-          set -x
-          sw_vers
-          uname -m
-          sysctl -n hw.ncpu hw.memsize
-          df -h /
-          df -h "$RUNNER_TEMP"
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-version
-          python3 -V
-          python3 -c "import platform,sys;print('python arch', platform.machine(), sys.prefix)"
-          du -sh /Applications/Xcode*.app | head -2 || true
-          echo "livre_kb=$(df -k / | awk 'NR==2{print $4}')"
+          touch "$LOG"
+          {
+            sw_vers; uname -m
+            sysctl -n hw.ncpu hw.memsize
+            df -h /
+            df -h "$RUNNER_TEMP"
+            xcodebuild -version
+            xcrun --sdk iphoneos --show-sdk-version || true
+            python3 -V
+            python3 -c "import platform;print('python arch', platform.machine())"
+            du -sh /Applications/Xcode*.app | head -2
+            echo "livre_gb_root=$(df -g / | awk 'NR==2{print $4}')"
+          } 2>&1 | tee -a "$LOG"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -33,37 +37,39 @@ jobs:
 
       - name: nxnative (commit fixado)
         run: |
-          git clone --depth 1 https://github.com/seedds/nxnative.git nxnative
-          git -C nxnative rev-parse HEAD | tee nxnative-head.txt
+          git clone --depth 1 https://github.com/seedds/nxnative.git nxnative 2>&1 | tee -a "$LOG"
+          git -C nxnative rev-parse HEAD | tee -a "$LOG"
 
       - name: Ferramentas
         run: |
-          set -x
-          command -v xcodegen || brew install xcodegen
-          python3 -m pip install --user lz4 "capstone>=5,<6" fonttools nsz zbic
-          xcodebuild -downloadComponent MetalToolchain
-          xcrun metal --version
+          {
+            command -v xcodegen || brew install xcodegen
+            python -m pip install lz4 "capstone>=5,<6" fonttools
+            python -m pip install nsz zbic || echo "AVISO: nsz/zbic nao instalaram (smoke nao precisa)"
+            xcodebuild -downloadComponent MetalToolchain
+            xcrun metal --version
+          } 2>&1 | tee -a "$LOG"
 
       - name: Smoke build do projeto iOS de producao (sem jogo)
         run: |
-          python3 nxnative/dm/ios/tools/build_smoke.py --output "$RUNNER_TEMP/ios-smoke" 2>&1 | tail -60
-          find "$RUNNER_TEMP/ios-smoke" -maxdepth 6 -name '*.app' -type d | tee app-path.txt
+          python3 nxnative/dm/ios/tools/build_smoke.py --output "$RUNNER_TEMP/ios-smoke" 2>&1 | tee -a "$LOG"
+          find "$RUNNER_TEMP/ios-smoke" -maxdepth 6 -name '*.app' -type d | tee -a "$LOG" | tee app-path.txt
 
       - name: Empacota IPA nao assinado
         run: |
-          APP=$(head -1 app-path.txt)
-          test -d "$APP" || { echo "sem .app: build falhou acima"; exit 1; }
+          APP=$(grep '\.app$' app-path.txt | head -1)
+          test -d "$APP" || { echo "sem .app: ver o log" | tee -a "$LOG"; exit 1; }
           rm -rf out && mkdir -p out/Payload
           cp -R "$APP" out/Payload/
           ( cd out && zip -qry ../nxnative-fixture.ipa Payload )
-          ls -l nxnative-fixture.ipa
-          unzip -l nxnative-fixture.ipa | tail -5
+          ls -l nxnative-fixture.ipa | tee -a "$LOG"
+          unzip -l nxnative-fixture.ipa | tail -5 | tee -a "$LOG"
 
-      - name: Verificacao de 4 camadas
-        run: python3 tools/verify_ipa.py nxnative-fixture.ipa | tee verify.txt
+      - name: Verificacao de camadas
+        run: python3 tools/verify_ipa.py nxnative-fixture.ipa 2>&1 | tee -a "$LOG" | tee verify.txt
 
       - name: Disco depois do build
-        run: df -h / "$RUNNER_TEMP"
+        run: df -h / "$RUNNER_TEMP" 2>&1 | tee -a "$LOG"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
@@ -72,17 +78,27 @@ jobs:
           path: |
             app-path.txt
             verify.txt
+            ci.log
             nxnative-fixture.ipa
-            nxnative-head.txt
           retention-days: 5
 
-      - name: Publica como release (URL baixavel sem login)
+      - name: Publica o IPA (URL baixavel sem login)
         if: success()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "probe-${{ github.run_number }}" nxnative-fixture.ipa verify.txt nxnative-head.txt \
+          sha256sum nxnative-fixture.ipa > nxnative-fixture.ipa.sha256
+          cat nxnative-fixture.ipa.sha256 | tee -a "$LOG"
+          gh release create "probe-${{ github.run_number }}" nxnative-fixture.ipa nxnative-fixture.ipa.sha256 verify.txt \
             --title "nxnative probe ${{ github.run_number }}" \
             --notes "Fixture: projeto iOS de producao compilado com modulos sinteticos. NAO contem jogo."
-          sha256sum nxnative-fixture.ipa | tee nxnative-fixture.ipa.sha256
-          gh release upload "probe-${{ github.run_number }}" nxnative-fixture.ipa.sha256
+
+      - name: Publica o log da falha (para leitura sem token)
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tail -200 "$LOG" || true
+          gh release create "log-${{ github.run_number }}" "$LOG" \
+            --title "nxnative probe log ${{ github.run_number }}" \
+            --notes "Falha do probe; ci.log anexado."
