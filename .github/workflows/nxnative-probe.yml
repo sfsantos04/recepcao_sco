@@ -1,0 +1,88 @@
+name: nxnative-probe
+on:
+  push:
+    branches: [nxnative-ci]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: xcode-27
+    timeout-minutes: 90
+    steps:
+      - name: Runner (medidas reais)
+        run: |
+          set -x
+          sw_vers
+          uname -m
+          sysctl -n hw.ncpu hw.memsize
+          df -h /
+          df -h "$RUNNER_TEMP"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          python3 -V
+          python3 -c "import platform,sys;print('python arch', platform.machine(), sys.prefix)"
+          du -sh /Applications/Xcode*.app | head -2 || true
+          echo "livre_kb=$(df -k / | awk 'NR==2{print $4}')"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: nxnative (commit fixado)
+        run: |
+          git clone --depth 1 https://github.com/seedds/nxnative.git nxnative
+          git -C nxnative rev-parse HEAD | tee nxnative-head.txt
+
+      - name: Ferramentas
+        run: |
+          set -x
+          command -v xcodegen || brew install xcodegen
+          python3 -m pip install --user lz4 "capstone>=5,<6" fonttools nsz zbic
+          xcodebuild -downloadComponent MetalToolchain
+          xcrun metal --version
+
+      - name: Smoke build do projeto iOS de producao (sem jogo)
+        run: |
+          python3 nxnative/dm/ios/tools/build_smoke.py --output "$RUNNER_TEMP/ios-smoke" 2>&1 | tail -60
+          find "$RUNNER_TEMP/ios-smoke" -maxdepth 6 -name '*.app' -type d | tee app-path.txt
+
+      - name: Empacota IPA nao assinado
+        run: |
+          APP=$(head -1 app-path.txt)
+          test -d "$APP" || { echo "sem .app: build falhou acima"; exit 1; }
+          rm -rf out && mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          ( cd out && zip -qry ../nxnative-fixture.ipa Payload )
+          ls -l nxnative-fixture.ipa
+          unzip -l nxnative-fixture.ipa | tail -5
+
+      - name: Verificacao de 4 camadas
+        run: python3 tools/verify_ipa.py nxnative-fixture.ipa | tee verify.txt
+
+      - name: Disco depois do build
+        run: df -h / "$RUNNER_TEMP"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: nxnative-probe
+          path: |
+            app-path.txt
+            verify.txt
+            nxnative-fixture.ipa
+            nxnative-head.txt
+          retention-days: 5
+
+      - name: Publica como release (URL baixavel sem login)
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "probe-${{ github.run_number }}" nxnative-fixture.ipa verify.txt nxnative-head.txt \
+            --title "nxnative probe ${{ github.run_number }}" \
+            --notes "Fixture: projeto iOS de producao compilado com modulos sinteticos. NAO contem jogo."
+          sha256sum nxnative-fixture.ipa | tee nxnative-fixture.ipa.sha256
+          gh release upload "probe-${{ github.run_number }}" nxnative-fixture.ipa.sha256
