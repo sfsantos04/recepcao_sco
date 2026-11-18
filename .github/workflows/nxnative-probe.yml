@@ -8,27 +8,23 @@ permissions:
   contents: write
 
 env:
-  LOG: ci.log
+  DM_GAME: "010015100B514000"
 
 jobs:
   probe:
     runs-on: xcode-27
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - name: Runner (medidas reais)
         run: |
-          touch "$LOG"
+          LOG="$RUNNER_TEMP/ci.log"; echo "LOG=$LOG" >> "$GITHUB_ENV"; touch "$LOG"
           {
-            sw_vers; uname -m
-            sysctl -n hw.ncpu hw.memsize
-            df -h /
-            df -h "$RUNNER_TEMP"
-            xcodebuild -version
-            xcrun --sdk iphoneos --show-sdk-version || true
-            python3 -V
-            python3 -c "import platform;print('python arch', platform.machine())"
+            echo "== relogio"; date -u
+            sw_vers; uname -m; sysctl -n hw.ncpu hw.memsize
+            echo "== disco antes"; df -h / "$RUNNER_TEMP"; echo "livre_gb_root=$(df -g / | awk 'NR==2{print $4}')"
+            xcodebuild -version; xcrun --sdk iphoneos --show-sdk-version || true
+            python3 -V; python3 -c "import platform;print('python arch', platform.machine())"
             du -sh /Applications/Xcode*.app | head -2
-            echo "livre_gb_root=$(df -g / | awk 'NR==2{print $4}')"
           } 2>&1 | tee -a "$LOG"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -44,26 +40,27 @@ jobs:
         run: |
           {
             command -v xcodegen || brew install xcodegen
-            python -m pip install lz4 "capstone>=5,<6" fonttools
-            python -m pip install nsz zbic || echo "AVISO: nsz/zbic nao instalaram (smoke nao precisa)"
+            python -m pip install lz4 "capstone>=5,<6" fonttools nsz zbic
             xcodebuild -downloadComponent MetalToolchain
             xcrun metal --version
           } 2>&1 | tee -a "$LOG"
 
-      - name: Smoke build do projeto iOS de producao (sem jogo)
+      - name: Smoke build iOS de producao (GAME=$DM_GAME, sem jogo)
         run: |
+          echo "== inicio $(date -u +%T)" | tee -a "$LOG"
           python3 nxnative/dm/ios/tools/build_smoke.py --output "$RUNNER_TEMP/ios-smoke" 2>&1 | tee -a "$LOG"
-          find "$RUNNER_TEMP/ios-smoke" -maxdepth 6 -name '*.app' -type d | tee -a "$LOG" | tee app-path.txt
+          echo "== fim $(date -u +%T)" | tee -a "$LOG"
 
-      - name: Empacota IPA nao assinado
+      - name: Localiza o .app e empacota IPA nao assinado
         run: |
-          APP=$(grep '\.app$' app-path.txt | head -1)
-          test -d "$APP" || { echo "sem .app: ver o log" | tee -a "$LOG"; exit 1; }
+          APP=$(find "$RUNNER_TEMP/ios-smoke" -maxdepth 12 -name '*.app' -type d | head -1)
+          echo "app=$APP" | tee -a "$LOG"
+          test -d "$APP" || { echo "sem .app" | tee -a "$LOG"; exit 1; }
           rm -rf out && mkdir -p out/Payload
           cp -R "$APP" out/Payload/
-          ( cd out && zip -qry ../nxnative-fixture.ipa Payload )
+          ( cd out && zip -qry "$GITHUB_WORKSPACE/nxnative-fixture.ipa" Payload )
           ls -l nxnative-fixture.ipa | tee -a "$LOG"
-          unzip -l nxnative-fixture.ipa | tail -5 | tee -a "$LOG"
+          unzip -l nxnative-fixture.ipa | tail -6 | tee -a "$LOG"
 
       - name: Verificacao de camadas
         run: python3 tools/verify_ipa.py nxnative-fixture.ipa 2>&1 | tee -a "$LOG" | tee verify.txt
@@ -76,13 +73,12 @@ jobs:
         with:
           name: nxnative-probe
           path: |
-            app-path.txt
             verify.txt
-            ci.log
             nxnative-fixture.ipa
+            ${{ runner.temp }}/ci.log
           retention-days: 5
 
-      - name: Publica o IPA (URL baixavel sem login)
+      - name: Publica o IPA (URL publica)
         if: success()
         env:
           GH_TOKEN: ${{ github.token }}
@@ -91,14 +87,14 @@ jobs:
           cat nxnative-fixture.ipa.sha256 | tee -a "$LOG"
           gh release create "probe-${{ github.run_number }}" nxnative-fixture.ipa nxnative-fixture.ipa.sha256 verify.txt \
             --title "nxnative probe ${{ github.run_number }}" \
-            --notes "Fixture: projeto iOS de producao compilado com modulos sinteticos. NAO contem jogo."
+            --notes "Fixture: projeto iOS de producao compilado com modulos sinteticos (sem jogo). Prova a cadeia de build no runner arm64."
 
-      - name: Publica o log da falha (para leitura sem token)
-        if: failure()
+      - name: Publica o log (para leitura sem token)
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tail -200 "$LOG" || true
+          tail -60 "$LOG" || true
           gh release create "log-${{ github.run_number }}" "$LOG" \
             --title "nxnative probe log ${{ github.run_number }}" \
-            --notes "Falha do probe; ci.log anexado."
+            --notes "Log completo do probe (${{ job.status }})." || true
